@@ -30,6 +30,16 @@ class CurlHTTPClientCommonTestCase(httpclient_test.HTTPClientCommonTestCase):
         self.assertTrue(isinstance(client, CurlAsyncHTTPClient))
         return client
 
+    def test_strip_headers_on_redirect(self):
+        # This client delegates redirect following to libcurl (via FOLLOWLOCATION), so
+        # stripping auth headers on a cross-origin redirect is libcurl's job, not ours.
+        # libcurl only compared hostnames until 7.83.0 (curl's CVE-2022-27776), so older
+        # versions leak Authorization/Cookie when only the port or scheme changes.
+        if pycurl.version_info()[2] < 0x075300:
+            self.skipTest("libcurl < 7.83.0 does not strip auth headers on a "
+                          "redirect to a different port (curl CVE-2022-27776)")
+        super(CurlHTTPClientCommonTestCase, self).test_strip_headers_on_redirect()
+
 
 class DigestAuthHandler(RequestHandler):
     def initialize(self, username, password):

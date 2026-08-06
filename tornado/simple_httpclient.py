@@ -523,7 +523,7 @@ class _HTTPConnection(httputil.HTTPMessageDelegate):
                 for h in ["Content-Length", "Content-Type",
                           "Content-Encoding", "Transfer-Encoding"]:
                     try:
-                        del self.request.headers[h]
+                        del new_request.headers[h]
                     except KeyError:
                         pass
             new_request.original_request = original_request

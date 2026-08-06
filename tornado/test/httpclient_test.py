@@ -12,7 +12,7 @@ from io import BytesIO
 import time
 import unicodedata
 
-from tornado.escape import utf8, native_str
+from tornado.escape import utf8, native_str, json_encode, json_decode
 from tornado import gen
 from tornado.httpclient import HTTPRequest, HTTPResponse, _RequestProxy, HTTPError, HTTPClient
 from tornado.httpserver import HTTPServer
@@ -22,7 +22,7 @@ from tornado.log import gen_log
 from tornado import netutil
 from tornado.stack_context import ExceptionStackContext, NullContext
 from tornado.testing import AsyncHTTPTestCase, bind_unused_port, gen_test, ExpectLog
-from tornado.test.util import unittest, skipOnTravis, ignore_deprecation
+from tornado.test.util import unittest, skipOnTravis, ignore_deprecation, subTest
 from tornado.web import Application, RequestHandler, url
 from tornado.httputil import format_timestamp, HTTPHeaders
 
@@ -122,6 +122,11 @@ class SetHeaderHandler(RequestHandler):
                         self.request.arguments['v']):
             self.set_header(k, v)
 
+
+class EchoHeadersHandler(RequestHandler):
+    def get(self):
+        self.write(json_encode(dict(self.request.headers.get_all())))
+
 # These tests end up getting run redundantly: once here with the default
 # HTTPClient implementation, and then again in each implementation's own
 # test suite.
@@ -143,7 +148,20 @@ class HTTPClientCommonTestCase(AsyncHTTPTestCase):
             url("/all_methods", AllMethodsHandler),
             url('/patch', PatchHandler),
             url('/set_header', SetHeaderHandler),
+            url('/echo_headers', EchoHeadersHandler),
         ], gzip=True)
+
+    def setUp(self):
+        super(HTTPClientCommonTestCase, self).setUp()
+
+        # Add a second port (serving the same app) to the HTTP server, so we can test the
+        # effects of redirects that span different origins.
+        sock, port = bind_unused_port()
+        self.http_server.add_socket(sock)
+        self.__port2 = port
+
+    def get_url2(self, path):
+        return '%s://127.0.0.1:%s%s' % (self.get_protocol(), self.__port2, path)
 
     def test_patch_receives_payload(self):
         body = b"some patch data"
@@ -577,6 +595,51 @@ X-XSS-Protection: 1;
                 yield self.http_client.fetch("/hello", headers={"foo": header})
             with self.assertRaises(ValueError):
                 yield self.http_client.fetch("/hello", headers={header: "foo"})
+
+    def test_strip_headers_on_redirect(self):
+        # Ensure that headers that should be stripped on cross-origin redirects
+        # are stripped, even if the redirect is to a different port on localhost.
+        # Every case sends a User-Agent so that we can tell that non-auth headers
+        # are still passed through (this client sends no User-Agent by default).
+        test_cases = [
+            ("manual auth header",
+             dict(headers={"Authorization": "secret"}, user_agent="test-agent"), ""),
+            ("credentials in URL",
+             dict(user_agent="test-agent"), "me:secret"),
+            ("auth parameters",
+             dict(auth_username="me", auth_password="secret", user_agent="test-agent"), ""),
+            ("manual cookie header",
+             dict(headers={"Cookie": "secret"}, user_agent="test-agent"), ""),
+        ]
+        for name, kwargs, url_creds in test_cases:
+            with subTest(self, name=name, origin="different"):
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % self.get_url2("/echo_headers"))
+                if url_creds:
+                    url = url.replace("http://", "http://%s@" % url_creds)
+                response = self.fetch(**dict(dict(path=url), **kwargs))
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through
+                self.assertIn("User-Agent", echoed_headers)
+                # Auth headers are stripped, however they were set.
+                self.assertNotIn("Authorization", echoed_headers)
+                self.assertNotIn("Cookie", echoed_headers)
+            with subTest(self, name=name, origin="same"):
+                url = self.get_url(
+                    "/redirect?url=%s&status=302" % self.get_url("/echo_headers"))
+                if url_creds:
+                    url = url.replace("http://", "http://%s@" % url_creds)
+                response = self.fetch(**dict(dict(path=url), **kwargs))
+                response.rethrow()
+                echoed_headers = json_decode(response.body)
+                # Confirm that non-auth headers are getting through
+                self.assertIn("User-Agent", echoed_headers)
+                # Auth headers are not stripped when the redirect is same-origin.
+                # Each of our tests uses one of these headers, but not both.
+                self.assertTrue("Authorization" in echoed_headers or
+                                "Cookie" in echoed_headers)
+
 
 class RequestProxyTest(unittest.TestCase):
     def test_request_set(self):
