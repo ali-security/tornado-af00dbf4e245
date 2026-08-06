@@ -1,0 +1,128 @@
+name: Build Windows Wheels
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-windows-wheels:
+    name: Build tornado-5.1.1 - Python ${{ matrix.python-version }} (${{ matrix.arch-name }})
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.5 - 32-bit and 64-bit
+          # 3.5/3.6 distutils picks /MT + /nodefaultlib:libucrt.lib unless
+          # py_vcruntime_redist is set, so these legs need it pointed at a real
+          # vcruntime140.dll to match the public /MD, VCRUNTIME140.dll-linked pyd.
+          - python-version: '3.5'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+            needs-vcruntime: 'true'
+          - python-version: '3.5'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+            needs-vcruntime: 'true'
+
+          # Python 3.6 - 32-bit and 64-bit
+          - python-version: '3.6'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+            needs-vcruntime: 'true'
+          - python-version: '3.6'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+            needs-vcruntime: 'true'
+
+          # Python 3.7 - 32-bit and 64-bit
+          - python-version: '3.7'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+          - python-version: '3.7'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+
+    env:
+      TORNADO_EXTENSION: "1"
+
+    steps:
+    - name: Check the repo out with LF line endings
+      # GitHub's Windows runners default core.autocrlf to true, which rewrites
+      # tornado/test/static/robots.txt with CRLF and changes its length and md5,
+      # failing 32 StaticFileTest/wsgi_test range and etag assertions.
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+
+    - uses: actions/checkout@v3
+
+    - name: Set up Python ${{ matrix.python-version }} (${{ matrix.arch }})
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+        architecture: ${{ matrix.arch }}
+
+    - name: Display Python version and architecture
+      run: |
+        python --version
+        python -c "import struct; print('Architecture:', struct.calcsize('P') * 8, 'bit')"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --index-url https://:2018-09-16T19:22:58.819187Z@time-machines-pypi.sealsecurity.io/ --disable-pip-version-check --user --upgrade pip
+        python -m pip install --index-url https://:2018-09-16T19:22:58.819187Z@time-machines-pypi.sealsecurity.io/ tox wheel
+
+    - name: Build wheel
+      shell: cmd
+      run: |
+        for /f "usebackq tokens=*" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VS_PATH=%%i
+        call "%VS_PATH%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars-arch }}
+        set DISTUTILS_USE_SDK=1
+        set MSSdk=1
+        if not "${{ matrix.needs-vcruntime }}"=="true" goto :skip_vcruntime
+        for /f "usebackq delims=" %%v in (`where /r "%VS_PATH%\VC\Redist\MSVC" vcruntime140.dll ^| findstr /i /c:"\${{ matrix.arch }}\Microsoft.VC" ^| findstr /v /i /c:"onecore" ^| findstr /v /i /c:"debug"`) do set py_vcruntime_redist=%%v
+        if not defined py_vcruntime_redist (
+          echo ERROR: no ${{ matrix.arch }} vcruntime140.dll found under "%VS_PATH%\VC\Redist\MSVC" - refusing to build a static-CRT ^(/MT^) extension
+          exit /b 1
+        )
+        echo Resolved py_vcruntime_redist=%py_vcruntime_redist%
+        :skip_vcruntime
+        python setup.py bdist_wheel
+
+    - name: List built wheels
+      run: |
+        dir dist\
+
+    - name: Verify wheel name
+      run: |
+        python -c "import os; files = os.listdir('dist'); print('Built:', files[0] if files else 'No files'); pyver = '${{ matrix.python-version }}'.replace('.', ''); expected = 'tornado-5.1.1-cp' + pyver + 'm-cp' + pyver + 'm-${{ matrix.arch-name }}.whl'; print('Expected: ' + expected)"
+
+    - name: Upload wheels as artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: tornado-windows-wheels-py${{ matrix.python-version }}-${{ matrix.arch-name }}
+        path: dist/*.whl
+        if-no-files-found: error
+
+    - name: Install built wheel
+      shell: cmd
+      run: |
+        for %%f in (dist\*.whl) do python -m pip install --no-index %%f
+
+    - name: Verify the compiled speedups module is installed
+      working-directory: maint
+      run: |
+        python -c "import tornado.speedups; print(tornado.speedups.__file__)"
+
+    - name: Run tornado test suite
+      working-directory: maint
+      env:
+        ASYNC_TEST_TIMEOUT: "15"
+      run: |
+        python -m tornado.test.runtests

@@ -1,0 +1,137 @@
+name: Build Source Distribution
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-sdist:
+    name: Build tornado-5.1.1 Source Distribution
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.6.15-slim-buster
+
+    steps:
+    - uses: actions/checkout@v3
+
+    # - name: Install build dependencies
+    #   run: |
+    #     apt-get update
+    #     apt-get install -y build-essential python-dev
+
+    - name: Install Python dependencies
+      run: |
+        pip install setuptools==45
+
+    - name: Display Python version
+      run: |
+        python --version
+        pip list
+
+    - name: Build source distribution
+      run: |
+        python setup.py sdist
+
+    - name: List built distribution
+      run: |
+        echo "Built source distribution:"
+        ls -lh dist/
+
+    - name: Verify tarball name
+      run: |
+        cd dist
+        if [ -f tornado-5.1.1.tar.gz ]; then
+          echo "✓ Source distribution created successfully: tornado-5.1.1.tar.gz"
+          tar -tzf tornado-5.1.1.tar.gz | head -20
+        else
+          echo "✗ Expected tornado-5.1.1.tar.gz not found"
+          ls -la
+          exit 1
+        fi
+
+    - name: Upload source distribution as artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: tornado-source-distribution
+        path: dist/*.tar.gz
+        if-no-files-found: error
+
+  test-linux:
+    name: Test tornado-5.1.1 Test Suite (Linux)
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.6.15-slim-buster
+      # Docker defaults net.ipv4.ip_unprivileged_port_start to 0, which lets the
+      # unprivileged test user bind port 1 and breaks
+      # tcpclient_test.test_source_port_fail. Restore the kernel default.
+      options: --sysctl net.ipv4.ip_unprivileged_port_start=1024
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install C build toolchain
+      run: |
+        # Debian buster is EOL; its packages are served from archive.debian.org.
+        echo "deb http://archive.debian.org/debian buster main" > /etc/apt/sources.list
+        apt-get -o Acquire::Check-Valid-Until=false update
+        # libcurl4-openssl-dev, NOT the gnutls flavour: per
+        # maint/vm/ubuntu14.04/setup.sh, "libcurl4-gnutls-dev ... has bugs that
+        # make our tests deadlock ... to get full coverage we have to use the
+        # openssl version".
+        apt-get install -y build-essential libcurl4-openssl-dev libssl-dev
+
+    - name: Install Python dependencies
+      run: |
+        pip install setuptools==45
+
+    - name: Install pycurl (enables tornado.test.curl_httpclient_test)
+      env:
+        # pycurl's compile-time SSL backend must match libcurl's link-time
+        # backend or "import pycurl" raises at runtime.
+        PYCURL_SSL_LIBRARY: openssl
+      run: |
+        pip install --index-url https://:2018-09-16T19:22:58.819187Z@time-machines-pypi.sealsecurity.io/ pycurl
+
+    - name: Verify pycurl is importable
+      working-directory: maint
+      run: |
+        python -c "import pycurl; print(pycurl.version)"
+
+    - name: Install tornado with the speedups C extension
+      run: |
+        export TORNADO_EXTENSION=1
+        python setup.py install
+
+    - name: Verify the compiled speedups module is installed
+      working-directory: maint
+      run: |
+        python -c "import tornado.speedups; print(tornado.speedups.__file__)"
+
+    - name: Create unprivileged test user
+      run: |
+        useradd -m tornadotest
+        chmod 0777 maint
+
+    - name: Relax the OpenSSL policy for tornado's 1024-bit test certificate
+      run: |
+        # buster pins CipherString to @SECLEVEL=2 and MinProtocol to TLSv1.2,
+        # which rejects tornado/test/test.crt ("EE_KEY_TOO_SMALL") and the
+        # SSLv3/TLSv1 servers in httpserver_test. The certificate ships inside
+        # the sdist, so relax the policy instead of touching it.
+        cat > /tmp/openssl-legacy.cnf <<'EOF'
+        openssl_conf = default_conf
+
+        [default_conf]
+        ssl_conf = ssl_sect
+
+        [ssl_sect]
+        system_default = system_default_sect
+
+        [system_default_sect]
+        MinProtocol = None
+        CipherString = DEFAULT@SECLEVEL=1
+        EOF
+        chmod 0644 /tmp/openssl-legacy.cnf
+
+    - name: Run tornado test suite
+      run: |
+        su tornadotest -c "cd maint && OPENSSL_CONF=/tmp/openssl-legacy.cnf ASYNC_TEST_TIMEOUT=15 python -m tornado.test.runtests"
