@@ -23,6 +23,12 @@ if PY3:
 else:
     import urlparse as urllib_parse
 
+# The performance regression tests below need a clock with a resolution finer
+# than the operations they measure. time.time() has a resolution of about 15ms
+# on Windows, which is too coarse for this, so prefer time.perf_counter() where
+# it is available (python 3.3+).
+_perf_counter = getattr(time, 'perf_counter', time.time)
+
 
 class TestUrlConcat(unittest.TestCase):
     def test_url_concat_no_query_params(self):
@@ -276,6 +282,30 @@ Foo
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
 
+    def test_disposition_param_linear_performance(self):
+        # This is a regression test for performance of parsing parameters
+        # to the content-disposition header, specifically for semicolons within
+        # quoted strings.
+        def f(n):
+            start = _perf_counter()
+            message = (
+                b"--1234\r\nContent-Disposition: form-data; " +
+                b'x="' +
+                b";" * n +
+                b'"; ' +
+                b'name="files"; filename="a.txt"\r\n\r\nFoo\r\n--1234--\r\n'
+            )
+            args = {}
+            files = {}
+            parse_multipart_form_data(b"1234", message, args, files)
+            return _perf_counter() - start
+
+        d1 = f(1000)
+        d2 = f(10000)
+        if d2 / d1 > 20:
+            self.fail('Disposition param parsing is not linear: '
+                      'd1=%s vs d2=%s' % (d1, d2))
+
     def test_multipart_config(self):
         boundary = b"1234"
         body = b"""--1234
@@ -453,6 +483,20 @@ Foo: even
         self.assertEqual(headers['quux'], 'xyzzy')
         self.assertEqual(sorted(headers.get_all()), [('Foo', 'bar'), ('Quux', 'xyzzy')])
 
+    def test_delete_multi_value(self):
+        # Deleting a header works whether or not its combined value has been
+        # computed (the combined value is cached lazily).
+        headers = HTTPHeaders()
+        headers.add('Foo', '1')
+        headers.add('Foo', '2')
+        self.assertIn('foo', headers)
+        del headers['foo']
+        self.assertNotIn('foo', headers)
+        self.assertEqual(headers.get_list('foo'), [])
+        self.assertEqual(list(headers.get_all()), [])
+        self.assertEqual(len(headers), 0)
+        self.assertRaises(KeyError, headers.__delitem__, 'foo')
+
     def test_string(self):
         headers = HTTPHeaders()
         headers.add("Foo", "1")
@@ -460,6 +504,22 @@ Foo: even
         headers.add("Foo", "3")
         headers2 = HTTPHeaders.parse(str(headers))
         self.assertEquals(headers, headers2)
+
+    def test_linear_performance(self):
+        def f(n):
+            start = _perf_counter()
+            headers = HTTPHeaders()
+            for i in range(n):
+                headers.add("X-Foo", "bar")
+            return _perf_counter() - start
+
+        # This runs under 50ms on my laptop as of 2025-12-09.
+        d1 = f(10000)
+        d2 = f(100000)
+        if d2 / d1 > 20:
+            # d2 should be about 10x d1 but allow a wide margin for variability.
+            self.fail('HTTPHeaders.add() does not scale linearly: '
+                      'd1=%s vs d2=%s' % (d1, d2))
 
 
 class FormatTimestampTest(unittest.TestCase):
