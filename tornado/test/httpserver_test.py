@@ -394,6 +394,124 @@ class HTTPServerRawTest(AsyncHTTPTestCase):
         self.stream.close()
         super(HTTPServerRawTest, self).tearDown()
 
+    def test_chunked_request_body_duplicate_header(self):
+        with ExpectLog(gen_log, ".*Unsupported Transfer-Encoding chunked,chunked"):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+Transfer-Encoding: chunked
+
+""")
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+            self.assertEqual('HTTP/1.1', start_line.version)
+            self.assertEqual(400, start_line.code)
+            self.assertEqual('Bad Request', start_line.reason)
+
+    def test_chunked_request_body_unsupported_transfer_encoding(self):
+        # We don't support transfer-encodings other than chunked.
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: gzip, chunked
+
+2
+ok
+0
+
+"""
+        )
+        with ExpectLog(gen_log, ".*Unsupported Transfer-Encoding gzip, chunked"):
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+        self.assertEqual(400, start_line.code)
+
+    def test_chunked_request_body_transfer_encoding_and_content_length(self):
+        # Transfer-encoding and content-length are mutually exclusive
+        self.stream.write(
+            b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: chunked
+Content-Length: 2
+
+2
+ok
+0
+
+"""
+        )
+        with ExpectLog(gen_log, ".*Response with both Transfer-Encoding and Content-Length"):
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+        self.assertEqual(400, start_line.code)
+
+    def test_chunked_request_body_unicode_whitespace(self):
+        # Only SP and HTAB may be stripped from a header value. A value of
+        # "\xa0chunked" (latin1 NON-BREAKING SPACE) used to be stripped down to
+        # "chunked", so a proxy that does not strip it and tornado, which did,
+        # would disagree about the framing of the message.
+        # The value reaches the log as a native_str, so match the non-ascii
+        # byte loosely: it is latin1 on python 3 and utf8 on python 2.
+        with ExpectLog(gen_log, ".*Unsupported Transfer-Encoding \\W+chunked"):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Transfer-Encoding: \xa0chunked
+
+2
+ok
+0
+
+""")
+            read_stream_body(self.stream, self.stop)
+            start_line, headers, response = self.wait()
+        self.assertEqual(400, start_line.code)
+
+    @gen_test
+    def test_smuggled_request_duplicate_transfer_encoding(self):
+        # The GHSA-753j-mpmx-qq6g proof of concept. A request carrying two
+        # "Transfer-Encoding: chunked" headers used to be read as having no
+        # body at all, so the chunked body that follows was parsed as a second,
+        # smuggled request. Only one response (a 400) may come back, and the
+        # connection must be closed rather than left desynchronized.
+        with ExpectLog(gen_log, ".*Unsupported Transfer-Encoding chunked,chunked"):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+Transfer-Encoding: chunked
+
+1
+Z
+0
+
+""".replace(b"\n", b"\r\n"))
+            response = yield self.stream.read_until_close()
+        self.assertTrue(response.startswith(b"HTTP/1.1 400"), response)
+        # The smuggled body must not have produced a second response.
+        self.assertEqual(1, response.count(b"HTTP/1.1 "), response)
+
+    @gen_test
+    def test_smuggled_request_chunk_ext(self):
+        # The advisory's escalation of the same flaw: with a chunk extension
+        # the smuggled request could elicit a 405 instead of a 400, which does
+        # not force a connection closure and so desynchronizes the connection.
+        with ExpectLog(gen_log, ".*Unsupported Transfer-Encoding chunked,chunked"):
+            self.stream.write(b"""\
+POST /echo HTTP/1.1
+Host: localhost
+Transfer-Encoding: chunked
+Transfer-Encoding: chunked
+
+1;GET / HTTP/1.1
+Z
+0
+
+""".replace(b"\n", b"\r\n"))
+            response = yield self.stream.read_until_close()
+        self.assertTrue(response.startswith(b"HTTP/1.1 400"), response)
+        self.assertEqual(1, response.count(b"HTTP/1.1 "), response)
+
     def test_empty_request(self):
         self.stream.close()
         self.io_loop.add_timeout(datetime.timedelta(seconds=0.001), self.stop)
